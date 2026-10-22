@@ -29,6 +29,9 @@ jobs:
       - name: Run Gigahertz Raffle Monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'gigahertz-raffle-b8824aed1ade' }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO || 'teddyprendergast@gmail.com' }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER || 'teddyprendergast@gmail.com' }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
         run: |
           python monitor_raffles.py --json-out raffle_snapshot.json
 

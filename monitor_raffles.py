@@ -39,11 +39,15 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from email.message import EmailMessage
 import html
+import io
 import json
 import math
 import os
 import re
+import smtplib
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -70,6 +74,7 @@ DEFAULT_HEADERS = {
 }
 
 DEFAULT_NTFY_TOPIC = "gigahertz-raffle-b8824aed1ade"
+DEFAULT_EMAIL_TO = "teddyprendergast@gmail.com"
 TARGET_GPUS = ("5070 Ti", "5080", "5090")
 HIGH_TIER_GPUS = ("5080", "5090")
 MAX_TICKET_CAP = 20000
@@ -564,16 +569,17 @@ def send_ntfy_alert(comp: CompetitionData, topic: str, dry_run: bool = False) ->
         return False
 
 
-def print_report(eligible: List[CompetitionData], all_inspected: List[Dict[str, Any]]) -> None:
+def format_report_text(eligible: List[CompetitionData], all_inspected: List[Dict[str, Any]]) -> str:
+    buf = io.StringIO()
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print("=" * 105)
-    print(f"GIGAHERTZ GIVEAWAYS RAFFLE MONITOR — {now_str}")
-    print("Budget: £10.00 | Discount Code: WELCOME10 (10% off -> £11.11 effective buying power)")
-    print("Filter: RTX 5070 Ti / 5080 / 5090 builds | Max Ticket Cap <= 20,000")
-    print("=" * 105)
+    buf.write("=" * 105 + "\n")
+    buf.write(f"GIGAHERTZ GIVEAWAYS RAFFLE MONITOR — {now_str}\n")
+    buf.write("Budget: £10.00 | Discount Code: WELCOME10 (10% off -> £11.11 effective buying power)\n")
+    buf.write("Filter: RTX 5070 Ti / 5080 / 5090 builds | Max Ticket Cap <= 20,000\n")
+    buf.write("=" * 105 + "\n")
 
     if not eligible:
-        print("\nNo active competitions matched the filter criteria.")
+        buf.write("\nNo active competitions matched the filter criteria.\n")
     else:
         for comp in eligible:
             sale_tag = f" [FLASH SALE from £{comp.regular_price:.2f}]" if comp.on_sale else ""
@@ -588,28 +594,28 @@ def print_report(eligible: List[CompetitionData], all_inspected: List[Dict[str, 
                 if comp.max_odds_one_in is not None
                 else "N/A"
             )
-            print(f"\n[{comp.product_id}] {comp.title} ({alert_tag})")
-            print(f"  URL                : {comp.url}")
-            print(f"  GPU Tier           : RTX {comp.gpu_tier}")
-            print(
+            buf.write(f"\n[{comp.product_id}] {comp.title} ({alert_tag})\n")
+            buf.write(f"  URL                : {comp.url}\n")
+            buf.write(f"  GPU Tier           : RTX {comp.gpu_tier}\n")
+            buf.write(
                 f"  Ticket Price       : £{comp.ticket_price:.2f}{sale_tag} "
-                f"(Effective w/ WELCOME10: £{comp.discounted_price_welcome10:.3f})"
+                f"(Effective w/ WELCOME10: £{comp.discounted_price_welcome10:.3f})\n"
             )
-            print(f"  Tickets for £10    : {comp.tickets_for_10_gbp} tickets")
-            print(
+            buf.write(f"  Tickets for £10    : {comp.tickets_for_10_gbp} tickets\n")
+            buf.write(
                 f"  Tickets Sold / Cap : {comp.tickets_sold:,} / {comp.ticket_cap:,} "
-                f"({comp.percent_sold:.1f}% sold, {comp.tickets_remaining:,} left)"
+                f"({comp.percent_sold:.1f}% sold, {comp.tickets_remaining:,} left)\n"
             )
-            print(f"  Draw Closing Date  : {comp.closing_iso} ({comp.hours_until_close} hours remaining)")
-            print(f"  Live Odds (£10)    : {live_odds_str}")
-            print(f"  Max Odds (£10)     : {max_odds_str}")
-            print(
+            buf.write(f"  Draw Closing Date  : {comp.closing_iso} ({comp.hours_until_close} hours remaining)\n")
+            buf.write(f"  Live Odds (£10)    : {live_odds_str}\n")
+            buf.write(f"  Max Odds (£10)     : {max_odds_str}\n")
+            buf.write(
                 f"  Alert Checks       : Trigger (a) [<=4h & live_odds>=0.01] = {comp.trigger_a_met} | "
-                f"Trigger (b) [5080/5090 <£0.75 & sold<7000] = {comp.trigger_b_met}"
+                f"Trigger (b) [5080/5090 <£0.75 & sold<7000] = {comp.trigger_b_met}\n"
             )
             if comp.alert_reasons:
                 for r in comp.alert_reasons:
-                    print(f"  >>> {r}")
+                    buf.write(f"  >>> {r}\n")
 
     # Show excluded GPU comps (e.g., >20,000 cap mega comps or 5060 Ti builds) for transparency
     excluded_pc = [
@@ -618,15 +624,148 @@ def print_report(eligible: List[CompetitionData], all_inspected: List[Dict[str, 
         and re.search(r"\b(?:pc|pcs|5060|5070|5080|5090)\b", x.get("title", ""), re.IGNORECASE)
     ]
     if excluded_pc:
-        print("\n" + "-" * 105)
-        print("Excluded PC / Tech Competitions:")
+        buf.write("\n" + "-" * 105 + "\n")
+        buf.write("Excluded PC / Tech Competitions:\n")
         for ex in excluded_pc:
-            print(
+            buf.write(
                 f"  - [{ex['product_id']}] {ex['title']} | "
                 f"Price: £{ex['ticket_price']:.2f} | Sold: {ex['tickets_sold']:,}/{ex['ticket_cap']:,} | "
-                f"{ex['filter_status']}"
+                f"{ex['filter_status']}\n"
             )
-    print("=" * 105)
+    buf.write("=" * 105 + "\n")
+    return buf.getvalue()
+
+
+def format_report_html(eligible: List[CompetitionData], all_inspected: List[Dict[str, Any]]) -> str:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    any_alert = any(c.trigger_a_met or c.trigger_b_met for c in eligible)
+    banner_bg = "#dc2626" if any_alert else "#1e293b"
+    banner_title = "🚨 GIGAHERTZ RAFFLE ALERT TRIGGERED!" if any_alert else "Gigahertz Giveaways Raffle Report"
+
+    rows_html = []
+    for c in eligible:
+        is_alert = c.trigger_a_met or c.trigger_b_met
+        row_bg = "#fef2f2" if is_alert else "#ffffff"
+        status_badge = (
+            f'<span style="background:#dc2626;color:#fff;padding:3px 8px;border-radius:4px;font-weight:bold;">'
+            f'ALERT: {"; ".join(c.alert_reasons)}</span>'
+            if is_alert
+            else '<span style="background:#e2e8f0;color:#334155;padding:3px 8px;border-radius:4px;">OK</span>'
+        )
+        live_odds_str = f"{c.live_odds*100:.2f}% (1 in {c.live_odds_one_in})" if c.live_odds is not None else "N/A"
+        max_odds_str = f"{c.max_odds*100:.2f}% (1 in {c.max_odds_one_in})" if c.max_odds_one_in is not None else "N/A"
+        rows_html.append(
+            f'<tr style="background:{row_bg};border-bottom:1px solid #e2e8f0;">'
+            f'<td style="padding:10px;"><a href="{html.escape(c.url)}" style="color:#2563eb;font-weight:600;text-decoration:none;">'
+            f'{html.escape(c.title)}</a></td>'
+            f'<td style="padding:10px;text-align:center;"><strong>RTX {html.escape(c.gpu_tier)}</strong></td>'
+            f'<td style="padding:10px;text-align:right;">£{c.ticket_price:.2f}<br>'
+            f'<small style="color:#64748b;">£{c.discounted_price_welcome10:.3f} w/ code</small></td>'
+            f'<td style="padding:10px;text-align:center;"><strong>{c.tickets_for_10_gbp}</strong></td>'
+            f'<td style="padding:10px;text-align:right;">{c.tickets_sold:,} / {c.ticket_cap:,}<br>'
+            f'<small style="color:#64748b;">({c.percent_sold:.1f}%)</small></td>'
+            f'<td style="padding:10px;text-align:right;"><strong>{live_odds_str}</strong></td>'
+            f'<td style="padding:10px;text-align:right;">{max_odds_str}</td>'
+            f'<td style="padding:10px;text-align:right;">{c.hours_until_close}h<br>'
+            f'<small style="color:#64748b;">{c.closing_iso or ""}</small></td>'
+            f'<td style="padding:10px;text-align:center;">{status_badge}</td>'
+            f'</tr>'
+        )
+
+    table_body = "\n".join(rows_html) if rows_html else '<tr><td colspan="9" style="padding:16px;text-align:center;">No matching competitions found.</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0f172a;margin:0;padding:16px;background:#f8fafc;">
+  <div style="max-width:960px;margin:0 auto;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+    <div style="background:{banner_bg};color:#ffffff;padding:18px 24px;">
+      <h2 style="margin:0;font-size:20px;">{banner_title}</h2>
+      <p style="margin:6px 0 0;font-size:13px;opacity:0.85;">{now_str} • £10 Budget (WELCOME10 10% off → £11.11 effective buying power)</p>
+    </div>
+    <div style="padding:20px;overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="background:#f1f5f9;color:#475569;text-align:left;border-bottom:2px solid #cbd5e1;">
+            <th style="padding:10px;">Competition</th>
+            <th style="padding:10px;text-align:center;">GPU</th>
+            <th style="padding:10px;text-align:right;">Price</th>
+            <th style="padding:10px;text-align:center;">Tix (£10)</th>
+            <th style="padding:10px;text-align:right;">Sold / Cap</th>
+            <th style="padding:10px;text-align:right;">Live Odds</th>
+            <th style="padding:10px;text-align:right;">Max Odds</th>
+            <th style="padding:10px;text-align:right;">Closes In</th>
+            <th style="padding:10px;text-align:center;">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table_body}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def send_email_report(
+    eligible: List[CompetitionData],
+    all_inspected: List[Dict[str, Any]],
+    email_to: str,
+    dry_run: bool = False,
+) -> bool:
+    """
+    Sends the formatted HTML + plain-text report to `email_to` via Gmail SMTP
+    (using EMAIL_USER / EMAIL_APP_PASSWORD environment variables).
+    """
+    smtp_user = os.environ.get("EMAIL_USER", email_to).strip()
+    smtp_password = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    any_alert = any(c.trigger_a_met or c.trigger_b_met for c in eligible)
+    subject_prefix = "🚨 [ALERT] " if any_alert else ""
+    subject = f"{subject_prefix}Gigahertz Giveaways Raffle Report ({now_str})"
+
+    text_body = format_report_text(eligible, all_inspected)
+    html_body = format_report_html(eligible, all_inspected)
+
+    if dry_run or not smtp_password:
+        if not smtp_password:
+            print(
+                f"\n[EMAIL INFO] To send email reports to {email_to}, set EMAIL_APP_PASSWORD "
+                f"(Gmail 16-char App Password) in environment / GitHub Secrets.",
+                file=sys.stderr,
+            )
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"Gigahertz Raffle Monitor <{smtp_user}>"
+    msg["To"] = email_to
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    try:
+        context = ssl.create_default_context()
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=20) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.starttls(context=context)
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        print(f"[EMAIL SENT] Report emailed to {email_to} via {smtp_host}:{smtp_port}")
+        return True
+    except Exception as exc:
+        print(f"[ERROR] Failed to send email report to {email_to}: {exc}", file=sys.stderr)
+        return False
+
+
+def print_report(eligible: List[CompetitionData], all_inspected: List[Dict[str, Any]]) -> None:
+    print(format_report_text(eligible, all_inspected), end="")
 
 
 def main() -> int:
@@ -635,6 +774,21 @@ def main() -> int:
         "--ntfy-topic",
         default=os.environ.get("NTFY_TOPIC") or DEFAULT_NTFY_TOPIC,
         help=f"ntfy.sh topic name (defaults to NTFY_TOPIC env var or '{DEFAULT_NTFY_TOPIC}')",
+    )
+    parser.add_argument(
+        "--email-to",
+        default=os.environ.get("EMAIL_TO") or DEFAULT_EMAIL_TO,
+        help=f"Recipient email address for the report (defaults to '{DEFAULT_EMAIL_TO}')",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Disable sending the email report",
+    )
+    parser.add_argument(
+        "--ntfy-report",
+        action="store_true",
+        help="Also POST the full summary report to ntfy.sh on every run",
     )
     parser.add_argument(
         "--json-out",
@@ -659,6 +813,9 @@ def main() -> int:
     for comp in eligible:
         if comp.trigger_a_met or comp.trigger_b_met:
             send_ntfy_alert(comp, topic=args.ntfy_topic, dry_run=args.dry_run)
+
+    if not args.no_email and args.email_to:
+        send_email_report(eligible, all_inspected, email_to=args.email_to, dry_run=args.dry_run)
 
     if args.test_alert and eligible:
         sample = eligible[0]
