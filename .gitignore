@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+raffle_snapshot.json
+.vscode/

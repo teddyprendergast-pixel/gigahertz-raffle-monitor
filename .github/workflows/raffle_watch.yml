@@ -1,0 +1,41 @@
+name: Gigahertz Giveaways Raffle Watch
+
+on:
+  schedule:
+    # Runs at 16:30, 18:00, 19:15, and 19:45 UTC every Monday (1) and Thursday (4)
+    - cron: '30 16 * * 1,4'
+    - cron: '0 18 * * 1,4'
+    - cron: '15 19 * * 1,4'
+    - cron: '45 19 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-raffles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Gigahertz Raffle Monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'gigahertz-raffle-b8824aed1ade' }}
+        run: |
+          python monitor_raffles.py --json-out raffle_snapshot.json
+
+      - name: Upload Live Raffle Snapshot Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raffle-snapshot
+          path: raffle_snapshot.json
+          retention-days: 7
